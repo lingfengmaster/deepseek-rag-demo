@@ -1,0 +1,10 @@
+# 运行依赖：pip install -r requirements.txt
+fastapi>=0.110
+uvicorn>=0.29
+streamlit>=1.32
+openai>=1.30
+python-dotenv>=1.0
+rank-bm25>=0.2.2
+jieba>=0.42
+sentence-transformers>=2.7
+numpy>=1.26
