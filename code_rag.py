@@ -18,7 +18,7 @@ from rank_bm25 import BM25Okapi
 from llm import chat
 from parse_c import parse_file
 
-CACHE_FILE = "data/func_summaries.json"
+CACHE_FILE = ".cache/func_summaries.json"
 
 # 改了摘要 prompt 就改这个版本号 —— 否则会一直命中旧缓存
 PROMPT_VERSION = "v2"
