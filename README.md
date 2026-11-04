@@ -120,6 +120,20 @@ while step < max_steps:
 
 重试策略在 `_is_retryable()` 一处实现：**5xx 重试，4xx 立刻失败**。曾因为绕过这层封装，Agent 遇到一次 503 就整个崩掉——这就是"防护必须集中在一处"的实证。
 
+### 6. 安全边界：能读文件，但不能读 `.env`
+
+Agent 可以调用 `read_file` 访问任意路径，而项目里有 `.env`（API key）。所以在工具执行层加了一道硬隔离：
+
+```python
+target = (ROOT / raw).resolve()          # 先规范化，解开 .. 和符号链接
+if not target.is_relative_to(ROOT):      # 再判断是否在项目目录内
+    raise PermissionError
+```
+
+外加敏感文件名/后缀黑名单（`.env`、`.git`、`.ssh`、`*.pem`、`*.key`）。
+
+**关键认知：不能依赖模型"自觉不读"。** 实测让它读 `.env`，它照做不误；拦住它的是本地代码，不是提示词。提示词只能减少无效调用，真正的隔离必须在执行层。
+
 ---
 
 ## 实验结果
@@ -134,6 +148,7 @@ while step < max_steps:
 | v4–v6 | 加语义题 + 向量 + RRF 对比 | 9/9 / 8/9 / 9/9 |
 | v7 | Agent：3 个工具 + 手写循环 | 工具选择 3/3 |
 | v8 | 重试下沉到 `llm.py` | Agent 具备 5xx 自动重试 |
+| v9 | 路径白名单 + 敏感文件黑名单 | `.env` 与 `/etc/passwd` 均被拦截 |
 
 ---
 
@@ -161,7 +176,7 @@ experiment.md    实验记录
 
 ## 后续计划
 
-- [ ] 工具参数校验与路径白名单（防越权读取）
+- [x] 工具参数校验与路径白名单（防止越权读取 `.env` / 系统文件）
 - [ ] Docker 一键部署
 - [ ] 表格转文本（table-to-text）预处理
 - [ ] 支持 PDF / Word 入库

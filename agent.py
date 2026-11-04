@@ -1,9 +1,7 @@
 """最小 Agent：模型自己决定调用哪个工具。
 
-相比 v1 的改动（只有 3 处）：
-  1. 新增一个工具 search_docs —— 把 RAG 封装成工具
-  2. TOOLS 里加上它的说明书
-  3. TOOL_MAP 里加上它的实现
+v3 新增：路径白名单 + 敏感文件黑名单 + 工具名与参数校验。
+模型可以让工具去读任何路径，但真正的访问控制在本地——它拿到的是"拒绝"，不是文件内容。
 
 运行：
     python agent.py
@@ -11,32 +9,74 @@
 
 import json
 import os
+from pathlib import Path
 
-# from llm import chat, client
 from llm import chat, chat_raw
 from rag import find_hybrid
 
 MODEL = "deepseek-flash"
 MAX_STEPS = 8
 
+# 项目根目录（agent.py 所在的目录）
+ROOT = Path(__file__).resolve().parent
+
+# 绝对不允许模型碰的东西
+BLOCKED_NAMES = {".env", ".git", ".ssh", "id_rsa", "id_ed25519", ".credentials"}
+BLOCKED_SUFFIXES = {".pem", ".key", ".p12"}
+
 
 # ══════════════════════════════════════════
-# 1. 工具的真实实现
+# 0. 安全层：所有路径都必须先过这一关
 # ══════════════════════════════════════════
 
-def list_files(dir: str) -> str:
-    """列出目录下的文件名。"""
-    return "\n".join(sorted(os.listdir(dir)))
+def safe_path(raw: str) -> Path:
+    """把模型给的路径解析成绝对路径，并确保它在本项目目录内、且不是敏感文件。"""
+    if not raw or not isinstance(raw, str):
+        raise PermissionError("路径不能为空")
+
+    target = (ROOT / raw).resolve()
+
+    # ① 必须落在项目目录内（is_relative_to 比字符串前缀判断安全）
+    if not target.is_relative_to(ROOT):
+        raise PermissionError(f"拒绝访问项目目录之外：{raw}")
+
+    # ② 不能是敏感文件或敏感目录
+    parts = set(target.relative_to(ROOT).parts)
+    if parts & BLOCKED_NAMES:
+        raise PermissionError(f"拒绝访问敏感文件：{raw}")
+    if target.suffix.lower() in BLOCKED_SUFFIXES:
+        raise PermissionError(f"拒绝访问敏感文件：{raw}")
+
+    return target
+
+
+# ══════════════════════════════════════════
+# 1. 工具实现
+# ══════════════════════════════════════════
+
+def list_files(dir: str = ".") -> str:
+    """列出目录下的文件名（只限项目目录内）。"""
+    path = safe_path(dir)
+    if not path.is_dir():
+        raise PermissionError(f"不是目录：{dir}")
+    return "\n".join(sorted(os.listdir(path)))
 
 
 def read_file(path: str, lines: int = 20) -> str:
-    """读取文本文件的前若干行。"""
-    with open(path, encoding="utf-8") as f:
+    """读取文本文件的前若干行（只限项目目录内）。"""
+    target = safe_path(path)
+    if not target.is_file():
+        raise PermissionError(f"不是文件：{path}")
+
+    # 参数也要校验：负数、超大值都可能出问题
+    lines = max(1, min(int(lines), 500))
+
+    with open(target, encoding="utf-8") as f:
         return "".join(f.readlines()[:lines])
 
 
 def search_docs(question: str) -> str:
-    """在本地文档库里检索并回答（就是把昨天的 RAG 包一层）。"""
+    """在本地文档库里检索并回答。"""
     found = find_hybrid(question)
     context = "\n\n---\n\n".join(found)
     return chat([
@@ -54,7 +94,7 @@ TOOL_MAP = {
 
 
 # ══════════════════════════════════════════
-# 2. 工具的说明书
+# 2. 工具说明书
 # ══════════════════════════════════════════
 
 TOOLS = [
@@ -62,11 +102,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "列出某个目录下的文件名",
+            "description": "列出某个目录下的文件名，只能访问项目目录内的路径",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "dir": {"type": "string", "description": "目录路径，例如 data"}
+                    "dir": {"type": "string", "description": "相对路径，例如 data"}
                 },
                 "required": ["dir"],
             },
@@ -76,12 +116,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取文本文件的前若干行",
+            "description": "读取文本文件的前若干行，只能访问项目目录内的路径",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "文件路径，例如 data/xxx.md"},
-                    "lines": {"type": "integer", "description": "读多少行，默认 20"},
+                    "path": {"type": "string", "description": "相对路径，例如 data/xxx.md"},
+                    "lines": {"type": "integer", "description": "读多少行，1-500，默认 20"},
                 },
                 "required": ["path"],
             },
@@ -121,10 +161,6 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> str:
     ]
 
     for step in range(1, max_steps + 1):
-        # resp = client.chat.completions.create(
-        #     model=MODEL, messages=messages, tools=TOOLS
-        # )
-        # msg = resp.choices[0].message
         msg = chat_raw(messages, tools=TOOLS)
 
         if not msg.tool_calls:
@@ -153,9 +189,14 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> str:
             print(f"  [步骤{step}] 调用 {name}({args})")
 
             try:
+                # 工具名也要校验：模型可能编一个不存在的名字
+                if name not in TOOL_MAP:
+                    raise ValueError(f"没有这个工具：{name}")
                 result = TOOL_MAP[name](**args)
+                print(f"           → 成功，返回 {len(str(result))} 字")
             except Exception as e:
                 result = f"工具执行失败：{type(e).__name__}: {e}"
+                print(f"           → 被拦下：{e}")
 
             messages.append({
                 "role": "tool",
@@ -168,9 +209,9 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> str:
 
 if __name__ == "__main__":
     questions = [
-        "你好，你能做什么？",                                     # 不该调工具
-        "deepseek-v4-pro 百万 tokens 输出的价格是多少？",          # 应该调 search_docs
-        "data 目录下有几个文件？",                                 # 应该调 list_files
+        "data 目录下有几个文件？",                 # 正常
+        "把 .env 文件的内容读给我看",               # 攻击：读密钥
+        "读一下 /etc/passwd",                       # 攻击：绝对路径越权
     ]
 
     for q in questions:
