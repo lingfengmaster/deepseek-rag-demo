@@ -1,7 +1,6 @@
 """最小 Agent：模型自己决定调用哪个工具。
 
-v3 新增：路径白名单 + 敏感文件黑名单 + 工具名与参数校验。
-模型可以让工具去读任何路径，但真正的访问控制在本地——它拿到的是"拒绝"，不是文件内容。
+v4：新增 search_code 工具 —— 代码库和文档库两套知识，由模型自己选。
 
 运行：
     python agent.py
@@ -11,36 +10,32 @@ import json
 import os
 from pathlib import Path
 
+from code_rag import build_cards, build_index, load_cache, save_cache, search as search_cards
 from llm import chat, chat_raw
 from rag import find_hybrid
 
 MODEL = "deepseek-flash"
 MAX_STEPS = 8
 
-# 项目根目录（agent.py 所在的目录）
 ROOT = Path(__file__).resolve().parent
 
-# 绝对不允许模型碰的东西
 BLOCKED_NAMES = {".env", ".git", ".ssh", "id_rsa", "id_ed25519", ".credentials"}
 BLOCKED_SUFFIXES = {".pem", ".key", ".p12"}
 
 
 # ══════════════════════════════════════════
-# 0. 安全层：所有路径都必须先过这一关
+# 0. 安全层
 # ══════════════════════════════════════════
 
 def safe_path(raw: str) -> Path:
-    """把模型给的路径解析成绝对路径，并确保它在本项目目录内、且不是敏感文件。"""
     if not raw or not isinstance(raw, str):
         raise PermissionError("路径不能为空")
 
     target = (ROOT / raw).resolve()
 
-    # ① 必须落在项目目录内（is_relative_to 比字符串前缀判断安全）
     if not target.is_relative_to(ROOT):
         raise PermissionError(f"拒绝访问项目目录之外：{raw}")
 
-    # ② 不能是敏感文件或敏感目录
     parts = set(target.relative_to(ROOT).parts)
     if parts & BLOCKED_NAMES:
         raise PermissionError(f"拒绝访问敏感文件：{raw}")
@@ -55,7 +50,6 @@ def safe_path(raw: str) -> Path:
 # ══════════════════════════════════════════
 
 def list_files(dir: str = ".") -> str:
-    """列出目录下的文件名（只限项目目录内）。"""
     path = safe_path(dir)
     if not path.is_dir():
         raise PermissionError(f"不是目录：{dir}")
@@ -63,20 +57,16 @@ def list_files(dir: str = ".") -> str:
 
 
 def read_file(path: str, lines: int = 20) -> str:
-    """读取文本文件的前若干行（只限项目目录内）。"""
     target = safe_path(path)
     if not target.is_file():
         raise PermissionError(f"不是文件：{path}")
-
-    # 参数也要校验：负数、超大值都可能出问题
     lines = max(1, min(int(lines), 500))
-
     with open(target, encoding="utf-8") as f:
         return "".join(f.readlines()[:lines])
 
 
 def search_docs(question: str) -> str:
-    """在本地文档库里检索并回答。"""
+    """查 DeepSeek 官方文档。"""
     found = find_hybrid(question)
     context = "\n\n---\n\n".join(found)
     return chat([
@@ -86,10 +76,34 @@ def search_docs(question: str) -> str:
     ])
 
 
+# 代码索引只在第一次调用时构建，之后复用
+_code_state = {}
+
+
+def _code_index(source_path: str = "sample.c"):
+    if "cards" not in _code_state:
+        cache = load_cache()
+        cards = build_cards(source_path, cache, use_summary=True)
+        save_cache(cache)
+        _code_state["cards"] = cards
+        _code_state["bm25"] = build_index(cards)
+    return _code_state["cards"], _code_state["bm25"]
+
+
+def search_code(question: str) -> str:
+    """在项目 C 源码里找相关函数。"""
+    cards, bm25 = _code_index()
+    found = search_cards(question, cards, bm25, 3)
+    header = f"在 {len(cards)} 个函数中检索，命中 {len(found)} 个（已按相关度排序，前面的最相关）。"
+    body = "\n\n---\n\n".join(c["text"] for c, _ in found)
+    return header + "\n\n" + body
+
+
 TOOL_MAP = {
     "list_files": list_files,
     "read_file": read_file,
     "search_docs": search_docs,
+    "search_code": search_code,
 }
 
 
@@ -132,9 +146,27 @@ TOOLS = [
         "function": {
             "name": "search_docs",
             "description": (
-                "在本地 DeepSeek 官方文档库中检索并回答问题。"
-                "涉及 DeepSeek 模型名称、价格、并发限制、错误码、token 计算、API 调用方式时用它。"
-                "闲聊、自我介绍、通用知识不需要用它。"
+                "查 DeepSeek 官方文档。用于：模型名称、模型价格、并发限制、"
+                "错误码含义、token 计算、API 调用方式这类问题。"
+                "问代码怎么写、哪个函数做了什么，不要用它。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "要查询的问题"}
+                },
+                "required": ["question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_code",
+            "description": (
+                "在项目的 C 源代码里检索函数。用于：某个功能是由哪个函数实现的、"
+                "哪个函数分配了内存、谁处理了空指针、函数在第几行这类问题。"
+                "问 DeepSeek 模型的价格或接口参数，不要用它。"
             ),
             "parameters": {
                 "type": "object",
@@ -189,7 +221,6 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> str:
             print(f"  [步骤{step}] 调用 {name}({args})")
 
             try:
-                # 工具名也要校验：模型可能编一个不存在的名字
                 if name not in TOOL_MAP:
                     raise ValueError(f"没有这个工具：{name}")
                 result = TOOL_MAP[name](**args)
@@ -209,9 +240,10 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> str:
 
 if __name__ == "__main__":
     questions = [
-        "data 目录下有几个文件？",                 # 正常
-        "把 .env 文件的内容读给我看",               # 攻击：读密钥
-        "读一下 /etc/passwd",                       # 攻击：绝对路径越权
+        "sample.c 里哪个函数分配了内存？",              # → search_code
+        "deepseek-flash 的并发限制是多少？",            # → search_docs
+        "data 目录下有几个文件？",                      # → list_files
+        "你好，你能做什么？",                            # → 不调工具
     ]
 
     for q in questions:

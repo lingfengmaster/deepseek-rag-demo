@@ -69,9 +69,9 @@ def chat(messages, model=DEFAULT_MODEL, temperature=0.7, retries=3):
     return msg.content
 
 
-def chat_raw(messages, model=DEFAULT_MODEL, tools=None, retries=3):
+def chat_raw(messages, model=DEFAULT_MODEL, tools=None, retries=3, temperature=0.0):
     """需要工具调用时用，返回原始 message（带 tool_calls）。"""
-    kwargs = dict(model=model, messages=messages, retries=retries)
+    kwargs = dict(model=model, messages=messages, retries=retries, temperature=temperature)
     if tools:
         kwargs["tools"] = tools
     return _create(**kwargs)
